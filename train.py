@@ -1,7 +1,7 @@
 """
-HSKM Training Script (Stability, Step-wise Logging & Token Tracking)
-- Tracks tokens seen during training
-- Real-time plotting by token count
+HSKM Training Script (Streaming Edition)
+- Uses Infinite Streaming: Model sees new stories every step
+- Fixed steps per epoch for consistent checkpointing/graphing
 """
 
 import os
@@ -15,10 +15,15 @@ from tqdm import tqdm
 import math
 import json
 import matplotlib.pyplot as plt
+from itertools import islice
 
 from model import HSKM, HSKMConfig
 from dataset import build_dataloaders
 from tokenizer import BPETokenizer
+
+# Define how many steps make an "epoch" in streaming mode
+STEPS_PER_EPOCH = 2000 
+VAL_STEPS = 200
 
 def get_lr_scheduler(optimizer, warmup_steps, total_steps, base_lr):
     def lr_lambda(current_step):
@@ -31,11 +36,10 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, base_lr):
 def save_loss_plot(losses, tokens, epoch, path):
     plt.figure(figsize=(10, 5))
     plt.plot(tokens, losses, label='Training Loss')
-    plt.title(f'Training Loss vs Tokens Seen (Epoch {epoch})')
+    plt.title(f'Training Loss (Tokens Seen: {tokens[-1]/1e6:.2f}M)')
     plt.xlabel('Tokens Seen')
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
-    # Format x-axis for readability (e.g., 1M, 2M)
     def format_func(value, tick_number):
         if value >= 1e6: return f'{value/1e6:.1f}M'
         if value >= 1e3: return f'{value/1e3:.0f}K'
@@ -55,6 +59,7 @@ def train(args):
         max_seq_len=args.seq_len,
     )
     
+    # Loader returns an IterableDataset wrapper
     train_loader, val_loader, tokenizer = build_dataloaders(seq_len=args.seq_len, batch_size=args.batch_size)
     config.vocab_size = tokenizer.vocab_size
     
@@ -71,7 +76,7 @@ def train(args):
     optimizer = AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
     scaler = GradScaler(enabled=use_amp)
     
-    total_steps = args.epochs * len(train_loader)
+    total_steps = args.epochs * STEPS_PER_EPOCH
     warmup_steps = int(0.05 * total_steps)
     scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps, args.lr)
 
@@ -83,17 +88,25 @@ def train(args):
     global_tokens = []
     total_tokens_seen = 0
 
-    print(f"Starting training on {device}...")
+    print(f"Starting Streaming Training...")
+    print(f"One Epoch = {STEPS_PER_EPOCH} steps. Total Steps: {total_steps}")
+    
+    # Iterator for the streaming loader
+    train_iter = iter(train_loader)
     
     for epoch in range(args.epochs):
         model.train()
         epoch_step_logs = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        pbar = tqdm(range(STEPS_PER_EPOCH), desc=f"Epoch {epoch+1}")
         
-        for step, (x, y) in enumerate(pbar):
+        for step in pbar:
+            try:
+                x, y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader) # Restart if end of stream
+                x, y = next(train_iter)
+                
             x, y = x.to(device), y.to(device)
-            
-            # Count tokens in this batch
             batch_tokens = x.numel()
             total_tokens_seen += batch_tokens
             
@@ -118,28 +131,28 @@ def train(args):
                 "loss": round(l_val, 4)
             })
             
-            # Show tokens seen in tqdm (K/M format)
             tokens_str = f"{total_tokens_seen/1e6:.2f}M" if total_tokens_seen >= 1e6 else f"{total_tokens_seen/1e3:.1f}K"
             pbar.set_postfix(loss=f"{l_val:.4f}", tokens=tokens_str, lr=f"{scheduler.get_last_lr()[0]:.2e}")
         
-        # Update logs & graphs
-        epoch_log_path = f"artifacts/epoch_{epoch+1}_steps.json"
-        with open(epoch_log_path, "w") as f:
+        # Save logs & plots
+        with open(f"artifacts/epoch_{epoch+1}_steps.json", "w") as f:
             json.dump(epoch_step_logs, f, indent=2)
-            
-        plot_path = f"artifacts/loss_curve.png"
-        save_loss_plot(global_losses, global_tokens, epoch + 1, plot_path)
-        print(f"Graph updated (Tokens: {tokens_str}) at {plot_path}")
+        save_loss_plot(global_losses, global_tokens, epoch + 1, f"artifacts/loss_curve.png")
 
-        # Validation
+        # Validation on a slice of val stream
         model.eval()
         val_loss = 0
+        val_iter = iter(val_loader)
         with torch.no_grad():
-            for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                loss, _ = model(x, labels=y)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
+            for _ in range(VAL_STEPS):
+                try:
+                    vx, vy = next(val_iter)
+                    vx, vy = vx.to(device), vy.to(device)
+                    vloss, _ = model(vx, labels=vy)
+                    val_loss += vloss.item()
+                except StopIteration:
+                    break
+        val_loss /= VAL_STEPS
         
         print(f"Val Loss: {val_loss:.4f} | PPL: {math.exp(min(val_loss, 20)):.2f}")
         
@@ -150,7 +163,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--seq_len", type=int, default=256)

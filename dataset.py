@@ -1,91 +1,65 @@
 """
-Dataset utilities for HSKM training with TinyStories.
-TinyStories provides simple, coherent narratives ideal for small model training.
+Streaming Dataset utilities for HSKM training with TinyStories.
+Uses HuggingFace streaming to provide fresh stories continuously.
 """
 
-import os
 import torch
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple
+from torch.utils.data import IterableDataset, DataLoader
+from typing import Iterator, Tuple
 from tokenizer import BPETokenizer
 
 
-def load_tinystories(max_samples: int = 50000) -> Tuple[List[str], List[str]]:
+def get_streaming_dataset():
+    """Returns a streaming HuggingFace dataset for TinyStories."""
+    from datasets import load_dataset
+    print("[Dataset] Initializing TinyStories Stream …")
+    # Stream both train and validation
+    ds_train = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+    ds_val   = load_dataset("roneneldan/TinyStories", split="validation", streaming=True)
+    return ds_train, ds_val
+
+
+class StreamingTokenDataset(IterableDataset):
     """
-    Loads TinyStories from HuggingFace.
-    We limit the sample count to ensure training fits within a reasonable window.
+    Infinite iterable dataset that streams stories, tokenizes them,
+    and yields fixed-length chunks.
     """
-    try:
-        from datasets import load_dataset
-        print(f"[Dataset] Loading TinyStories (max {max_samples} samples) …")
-        # TinyStories is large, so we use streaming or just select a subset
-        ds = load_dataset("roneneldan/TinyStories", split="train", streaming=False)
-        
-        # Take a subset for rapid training
-        train_data = ds.select(range(min(len(ds), max_samples)))
-        val_data   = load_dataset("roneneldan/TinyStories", split="validation", streaming=False)
-        
-        train_texts = [row["text"].strip() for row in train_data]
-        val_texts   = [row["text"].strip() for row in val_data.select(range(min(len(val_data), 2000)))]
-        
-        print(f"[Dataset] TinyStories loaded: {len(train_texts)} train, {len(val_texts)} val")
-        return train_texts, val_texts
-    except Exception as e:
-        print(f"[Dataset] TinyStories load failed: {e}. Falling back to synthetic.")
-        return _synthetic()
 
-def _synthetic():
-    sents = ["Once upon a time, there was a little bird who loved to sing . " * 5] * 1000
-    return sents[:800], sents[800:]
-
-def texts_to_ids(texts: List[str], tokenizer: BPETokenizer) -> np.ndarray:
-    all_ids = []
-    for text in texts:
-        # For TinyStories, we often want to separate stories with <eos>
-        all_ids.extend(tokenizer.encode(text, add_bos=True, add_eos=True))
-    return np.array(all_ids, dtype=np.int32)
-
-class TokenDataset(Dataset):
-    def __init__(self, token_ids: np.ndarray, seq_len: int):
+    def __init__(self, hf_stream, tokenizer: BPETokenizer, seq_len: int):
+        self.hf_stream = hf_stream
+        self.tokenizer = tokenizer
         self.seq_len = seq_len
-        n_chunks = len(token_ids) // (seq_len + 1)
-        self.data = torch.from_numpy(token_ids[:n_chunks * (seq_len + 1)]).long()
 
-    def __len__(self) -> int:
-        return len(self.data) // (self.seq_len + 1)
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        buffer = []
+        for example in self.hf_stream:
+            text = example["text"].strip()
+            # Tokenize and add to buffer
+            tokens = self.tokenizer.encode(text, add_bos=True, add_eos=True)
+            buffer.extend(tokens)
+            
+            # Yield chunks as they become available
+            while len(buffer) >= self.seq_len + 1:
+                chunk = buffer[:self.seq_len + 1]
+                buffer = buffer[self.seq_len + 1:]
+                
+                x = torch.tensor(chunk[:-1], dtype=torch.long)
+                y = torch.tensor(chunk[1:], dtype=torch.long)
+                yield x, y
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        start = idx * (self.seq_len + 1)
-        chunk = self.data[start : start + self.seq_len + 1]
-        return chunk[:-1], chunk[1:]
 
-def build_dataloaders(seq_len: int = 512, batch_size: int = 8, max_samples: int = 50000):
+def build_dataloaders(seq_len: int = 512, batch_size: int = 8):
     tokenizer = BPETokenizer()
-    train_texts, val_texts = load_tinystories(max_samples=max_samples)
+    ds_train, ds_val = get_streaming_dataset()
     
-    print("[Dataset] Tokenizing training set (this may take a minute) …")
-    train_ids = texts_to_ids(train_texts, tokenizer)
-    print("[Dataset] Tokenizing validation set …")
-    val_ids   = texts_to_ids(val_texts, tokenizer)
+    # Shuffle the stream using a buffer
+    ds_train = ds_train.shuffle(buffer_size=10000, seed=42)
     
-    print(f"[Dataset] Total train tokens: {len(train_ids):,}")
+    train_ds = StreamingTokenDataset(ds_train, tokenizer, seq_len)
+    val_ds   = StreamingTokenDataset(ds_val, tokenizer, seq_len)
     
-    train_ds = TokenDataset(train_ids, seq_len)
-    val_ds   = TokenDataset(val_ids, seq_len)
-    
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        pin_memory=True,
-        num_workers=0 # Set to 0 for Windows compatibility
-    )
-    val_loader = DataLoader(
-        val_ds, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        pin_memory=True
-    )
+    # For streaming, we don't shuffle in DataLoader, we shuffle the HF stream
+    train_loader = DataLoader(train_ds, batch_size=batch_size, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, pin_memory=True)
     
     return train_loader, val_loader, tokenizer
