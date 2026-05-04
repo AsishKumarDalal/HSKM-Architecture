@@ -1,14 +1,11 @@
 """
 Hierarchical Sparse Kernel Memory (HSKM) Architecture - V3.1 (Production)
 --------------------------------------------------------------------------
-Changes from V3:
-  - RoPE on queries for positional awareness.
-  - Optional causal gate on kernels (default OFF).
-  - Cleaned up LTM write logic with EMA-style updates.
-  - Gradient checkpointing added for memory efficiency.
-  - Sparse top_k clamped to min(top_k, n_kernels).
-  - Kernel init fallback from orthogonal to xavier_uniform.
-  - Device/dtype consistency enforced throughout.
+Large Model Configuration:
+  - d_model: 1024
+  - n_layers: 12
+  - n_heads: 16 (Fixed for divisibility)
+  - Gradient Checkpointing: ENABLED
 """
 
 import math
@@ -28,13 +25,13 @@ from torch import Tensor
 @dataclass
 class HSKMConfig:
     vocab_size: int = 50257
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    d_medium: int = 128
+    d_model: int = 1024
+    n_layers: int = 12
+    n_heads: int = 16
+    d_medium: int = 256
     n_kernels: int = 64
     top_k: int = 16
-    window: int = 512
+    window: int = 1024
     n_patterns: int = 8192
     mtm_decay: float = 0.95
     max_seq_len: int = 1024
@@ -42,7 +39,7 @@ class HSKMConfig:
     layer_norm_eps: float = 1e-5
     # V3.1 additions
     kernel_causal: bool = False
-    use_gradient_checkpointing: bool = False
+    use_gradient_checkpointing: bool = True
 
 
 # ─────────────────────────────────────────────
