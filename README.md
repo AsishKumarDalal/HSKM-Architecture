@@ -1,60 +1,30 @@
-# Hierarchical Sparse Kernel Memory (HSKM)
+# Hierarchical Sparse Kernel Memory (HSKM) - Scaled BPE Edition
 
-A hybrid language model combining **learned sparse kernel attention** with **hierarchical memory banks**.
+A hybrid language model combining **learned sparse kernel attention** with **hierarchical memory banks**, now scaled up and using **Byte-Pair Encoding (BPE)** like GPT-2.
+
+## Major Updates
+- **BPE Tokenization**: Switched to `tiktoken` with GPT-2 vocabulary for better generalization.
+- **Multi-Layer Architecture**: Added support for stacked HSKM blocks with residual connections and MLP layers.
+- **Increased Size**: Default configuration scaled to `d_model=512` and `n_layers=6` (adjustable).
 
 ## File Layout
+- `model.py`: Multi-layer HSKM blocks.
+- `tokenizer.py`: BPE encoding via `tiktoken`.
+- `dataset.py`: WikiText-2 loading with BPE tokens.
+- `train.py`: Training loop for the scaled model.
+- `generate.py`: Text generation utility.
 
-```
-statistical model/
-├── model.py          ← Full HSKM architecture (all nn.Module classes)
-├── tokenizer.py      ← Word-level tokenizer (build / save / load vocab)
-├── dataset.py        ← WikiText-2 loader + PyTorch Dataset / DataLoader
-├── train.py          ← Training loop (tqdm, mixed-precision, checkpointing)
-├── generate.py       ← Interactive REPL + single-prompt generation
-├── requirements.txt  ← pip dependencies
-└── checkpoints/      ← Created automatically during training
-    ├── vocab.json
-    ├── best.pt
-    ├── last.pt
-    └── history.json
-```
-
-## Quick Start
-
+## Setup
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
-
-# 2. Train  (~20-30 min on a single GPU, ~2-3 hours on CPU)
-python train.py
-
-# 3. Generate (interactive REPL)
-python generate.py
-
-# 4. Single prompt
-python generate.py --prompt "the quick brown fox" --max_tokens 80
 ```
 
-## Training CLI Options
+## Training
+```bash
+python train.py --epochs 3 --batch_size 8 --seq_len 128
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--epochs` | 5 | Training epochs |
-| `--batch_size` | 64 | Batch size |
-| `--lr` | 3e-4 | Peak learning rate |
-| `--seq_len` | 128 | Sequence length |
-| `--d_model` | 256 | Hidden dimension |
-| `--vocab_size` | 10000 | Max vocabulary size |
-| `--ckpt_dir` | checkpoints | Save directory |
-| `--resume` | False | Resume from last.pt |
-
-## Generation CLI Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--prompt` | None | Single prompt (omit for REPL) |
-| `--max_tokens` | 100 | Tokens to generate |
-| `--temperature` | 0.85 | Sampling temperature |
-| `--top_p` | 0.92 | Nucleus sampling p |
-| `--top_k` | 40 | Top-k filter |
-| `--ckpt` | checkpoints/best.pt | Checkpoint to load |
+## Generation
+```bash
+python generate.py --prompt "The future of AI is" --tokens 50
+```
