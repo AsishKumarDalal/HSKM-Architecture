@@ -21,7 +21,6 @@ from model import HSKM, HSKMConfig
 from dataset import build_dataloaders
 from tokenizer import BPETokenizer
 
-# Define how many steps make an "epoch" in streaming mode
 STEPS_PER_EPOCH = 2000 
 VAL_STEPS = 200
 
@@ -52,94 +51,54 @@ def save_loss_plot(losses, tokens, epoch, path):
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    
-    config = HSKMConfig(
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        max_seq_len=args.seq_len,
-    )
-    
-    # Loader returns an IterableDataset wrapper
+    config = HSKMConfig(d_model=args.d_model, n_layers=args.n_layers, max_seq_len=args.seq_len, use_gradient_checkpointing=args.checkpoint)
     train_loader, val_loader, tokenizer = build_dataloaders(seq_len=args.seq_len, batch_size=args.batch_size)
     config.vocab_size = tokenizer.vocab_size
-    
     model = HSKM(config).to(device)
-    
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': 0.1},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    
+    optim_groups = [{'params': decay_params, 'weight_decay': 0.1}, {'params': nodecay_params, 'weight_decay': 0.0}]
     optimizer = AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
     scaler = GradScaler(enabled=use_amp)
-    
     total_steps = args.epochs * STEPS_PER_EPOCH
     warmup_steps = int(0.05 * total_steps)
     scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps, args.lr)
-
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("artifacts", exist_ok=True)
-    
     best_val = float('inf')
     global_losses = []
     global_tokens = []
     total_tokens_seen = 0
-
-    print(f"Starting Streaming Training...")
-    print(f"One Epoch = {STEPS_PER_EPOCH} steps. Total Steps: {total_steps}")
-    
-    # Iterator for the streaming loader
     train_iter = iter(train_loader)
-    
     for epoch in range(args.epochs):
         model.train()
         epoch_step_logs = []
         pbar = tqdm(range(STEPS_PER_EPOCH), desc=f"Epoch {epoch+1}")
-        
         for step in pbar:
-            try:
-                x, y = next(train_iter)
+            try: x, y = next(train_iter)
             except StopIteration:
-                train_iter = iter(train_loader) # Restart if end of stream
+                train_iter = iter(train_loader)
                 x, y = next(train_iter)
-                
             x, y = x.to(device), y.to(device)
             batch_tokens = x.numel()
             total_tokens_seen += batch_tokens
-            
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=use_amp):
-                loss, _ = model(x, labels=y)
-            
+            with autocast(enabled=use_amp): loss, _ = model(x, labels=y)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            
             l_val = loss.item()
             global_losses.append(l_val)
             global_tokens.append(total_tokens_seen)
-            
-            epoch_step_logs.append({
-                "step": step,
-                "tokens_seen": total_tokens_seen,
-                "loss": round(l_val, 4)
-            })
-            
+            epoch_step_logs.append({"step": step, "tokens_seen": total_tokens_seen, "loss": round(l_val, 4)})
             tokens_str = f"{total_tokens_seen/1e6:.2f}M" if total_tokens_seen >= 1e6 else f"{total_tokens_seen/1e3:.1f}K"
             pbar.set_postfix(loss=f"{l_val:.4f}", tokens=tokens_str, lr=f"{scheduler.get_last_lr()[0]:.2e}")
-        
-        # Save logs & plots
-        with open(f"artifacts/epoch_{epoch+1}_steps.json", "w") as f:
-            json.dump(epoch_step_logs, f, indent=2)
+        with open(f"artifacts/epoch_{epoch+1}_steps.json", "w") as f: json.dump(epoch_step_logs, f, indent=2)
         save_loss_plot(global_losses, global_tokens, epoch + 1, f"artifacts/loss_curve.png")
-
-        # Validation on a slice of val stream
         model.eval()
         val_loss = 0
         val_iter = iter(val_loader)
@@ -150,12 +109,9 @@ def train(args):
                     vx, vy = vx.to(device), vy.to(device)
                     vloss, _ = model(vx, labels=vy)
                     val_loss += vloss.item()
-                except StopIteration:
-                    break
+                except StopIteration: break
         val_loss /= VAL_STEPS
-        
         print(f"Val Loss: {val_loss:.4f} | PPL: {math.exp(min(val_loss, 20)):.2f}")
-        
         if val_loss < best_val:
             best_val = val_loss
             torch.save({'model': model.state_dict(), 'config': config.__dict__}, "checkpoints/best.pt")
@@ -169,4 +125,5 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=8)
+    parser.add_argument("--checkpoint", action="store_true")
     train(parser.parse_args())

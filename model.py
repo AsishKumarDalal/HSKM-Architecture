@@ -1,17 +1,22 @@
 """
-Hierarchical Sparse Kernel Memory (HSKM) Architecture - Improved
-Refined for better convergence:
-- Multi-Head Sparse Kernel Attention
-- Gated Linear Unit (GLU) MLP
-- Residual scaling for deep initialization
-- RMSNorm for stability
+Hierarchical Sparse Kernel Memory (HSKM) Architecture - V3.1 (Production)
+--------------------------------------------------------------------------
+Changes from V3:
+  - RoPE on queries for positional awareness.
+  - Optional causal gate on kernels (default OFF).
+  - Cleaned up LTM write logic with EMA-style updates.
+  - Gradient checkpointing added for memory efficiency.
+  - Sparse top_k clamped to min(top_k, n_kernels).
+  - Kernel init fallback from orthogonal to xavier_uniform.
+  - Device/dtype consistency enforced throughout.
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 from torch import Tensor
 
@@ -24,10 +29,10 @@ from torch import Tensor
 class HSKMConfig:
     vocab_size: int = 50257
     d_model: int = 512
-    n_layers: int = 8               # Moderate depth
-    n_heads: int = 8                # Multi-head kernel attention
+    n_layers: int = 8
+    n_heads: int = 8
     d_medium: int = 128
-    n_kernels: int = 64             # More kernels for better coverage
+    n_kernels: int = 64
     top_k: int = 16
     window: int = 512
     n_patterns: int = 8192
@@ -35,6 +40,9 @@ class HSKMConfig:
     max_seq_len: int = 1024
     dropout: float = 0.1
     layer_norm_eps: float = 1e-5
+    # V3.1 additions
+    kernel_causal: bool = False
+    use_gradient_checkpointing: bool = False
 
 
 # ─────────────────────────────────────────────
@@ -56,92 +64,104 @@ class RMSNorm(nn.Module):
 
 
 class RoPE(nn.Module):
-    """Rotary Positional Embeddings for better sequence modeling."""
-    def __init__(self, dim: int, max_len: int = 2048):
+    def __init__(self, dim: int, max_len: int = 4096):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, x, seq_len):
-        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        t = torch.arange(max_len).float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb[None, :, :]
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+
+    @staticmethod
+    def _rotate_half(x: Tensor) -> Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary(self, x: Tensor, seq_len: int) -> Tensor:
+        cos = self.cos_cached[:, :, :seq_len, :x.size(-1)].to(dtype=x.dtype, device=x.device)
+        sin = self.sin_cached[:, :, :seq_len, :x.size(-1)].to(dtype=x.dtype, device=x.device)
+        return (x * cos) + (self._rotate_half(x) * sin)
 
 
 # ─────────────────────────────────────────────
-#  2. Refined Kernel Attention
+#  2. Multi-Head Kernel Attention
 # ─────────────────────────────────────────────
 
 class MultiHeadKernelAttention(nn.Module):
-    """
-    Splits kernels into heads. Each head attends to a subset of kernels.
-    """
     def __init__(self, config: HSKMConfig):
         super().__init__()
         self.n_heads = config.n_heads
         self.d_model = config.d_model
-        self.d_head  = config.d_model // config.n_heads
+        self.d_head = config.d_model // config.n_heads
         self.n_kernels = config.n_kernels
         self.top_k = config.top_k
         self.window = config.window
         self.scale = self.d_head ** -0.5
+        self.kernel_causal = config.kernel_causal
 
-        # Kernels are shared or per-head? Per-head is better for diversity.
-        self.kernel_centers = nn.Parameter(torch.empty(config.n_heads, config.n_kernels, self.d_head))
-        nn.init.orthogonal_(self.kernel_centers)
+        self.kernel_centers = nn.Parameter(
+            torch.empty(config.n_heads, config.n_kernels, self.d_head)
+        )
+        self._init_kernels()
 
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
+        self.rope = RoPE(self.d_head, max_len=config.max_seq_len)
+
+    def _init_kernels(self):
+        try:
+            for h in range(self.kernel_centers.size(0)):
+                nn.init.orthogonal_(self.kernel_centers.data[h])
+        except RuntimeError:
+            nn.init.xavier_uniform_(self.kernel_centers)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
-        # Q, V: [B, T, H, d_head]
         q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        q = self.rope.apply_rotary(q, seq_len=T)
 
-        # q: [B, H, T, d_head], kernels: [H, m, d_head]
-        # sims: [B, H, T, m]
         sims = torch.einsum("bhtd,hmd->bhtm", q, self.kernel_centers) * self.scale
-        attn = F.softmax(sims, dim=-1)
 
-        # Sparsity
-        if self.top_k < self.n_kernels:
-            topk_vals, topk_idx = torch.topk(attn, self.top_k, dim=-1)
-            sparse_attn = torch.zeros_like(attn)
-            sparse_attn.scatter_(-1, topk_idx, topk_vals)
+        if self.kernel_causal:
+            pos_fraction = torch.arange(T, device=x.device, dtype=x.dtype) / max(T, 1)
+            kernel_positions = torch.linspace(0, 1, self.n_kernels, device=x.device, dtype=x.dtype)
+            causal_gate = torch.sigmoid(10.0 * (pos_fraction[:, None] - kernel_positions[None, :]))
+            sims = sims + causal_gate[None, None, :, :].log().clamp(min=-10)
+
+        effective_k = min(self.top_k, self.n_kernels)
+        if effective_k < self.n_kernels:
+            topk_vals, topk_idx = torch.topk(sims, effective_k, dim=-1)
+            sparse_sims = torch.full_like(sims, float('-inf'))
+            sparse_sims.scatter_(-1, topk_idx, topk_vals)
+            attn = F.softmax(sparse_sims, dim=-1)
         else:
-            sparse_attn = attn
+            attn = F.softmax(sims, dim=-1)
 
-        sparse_attn = self.dropout(sparse_attn)
-
-        # Context: [B, H, T, d_head]
-        # sparse_attn: [B, H, T, m], kernels: [H, m, d_head]
-        kernel_context = torch.einsum("bhtm,hmd->bhtd", sparse_attn, self.kernel_centers)
-        
-        # Combine with values
+        attn = self.dropout(attn)
+        kernel_context = torch.einsum("bhtm,hmd->bhtd", attn, self.kernel_centers)
         out = (v * kernel_context).transpose(1, 2).reshape(B, T, D)
-        
-        # Causal window pool (simple version for multi-layer)
         return self.o_proj(self._causal_window_pool(out))
 
     def _causal_window_pool(self, h: Tensor) -> Tensor:
         B, T, D = h.shape
         cs = torch.cumsum(h, dim=1)
         cs_shifted = F.pad(cs, (0, 0, self.window, 0))[:, :T, :]
-        window_sum = (cs - cs_shifted)
-        counts = torch.arange(1, T + 1, device=h.device).clamp(max=self.window).float().view(1, T, 1)
+        window_sum = cs - cs_shifted
+        counts = torch.arange(1, T + 1, device=h.device, dtype=h.dtype).clamp(max=self.window).view(1, T, 1)
         return window_sum / counts
 
 
 # ─────────────────────────────────────────────
-#  3. Refined Gating & MLP
+#  3. MLP & Gating
 # ─────────────────────────────────────────────
 
 class SwiGLU(nn.Module):
-    """Better MLP than standard GELU."""
     def __init__(self, d_model: int, d_ff: int, dropout: float):
         super().__init__()
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
@@ -154,17 +174,14 @@ class SwiGLU(nn.Module):
 
 
 class HierarchicalGating(nn.Module):
-    """Dynamic fusion of STM, MTM, LTM."""
     def __init__(self, config: HSKMConfig):
         super().__init__()
         self.gate_gen = nn.Linear(config.d_model * 4, 3)
         self.proj = nn.Linear(config.d_model, config.d_model)
 
     def forward(self, h_s, h_m, h_l, x):
-        # x is the residual/embedding stream
         combined = torch.cat([h_s, h_m, h_l, x], dim=-1)
         gates = F.softmax(self.gate_gen(combined), dim=-1)
-        
         fused = (
             gates[..., 0:1] * h_s +
             gates[..., 1:2] * h_m +
@@ -174,38 +191,9 @@ class HierarchicalGating(nn.Module):
 
 
 # ─────────────────────────────────────────────
-#  4. HSKM Block & Model
+#  4. Memory Modules
 # ─────────────────────────────────────────────
 
-class HSKMBlock(nn.Module):
-    def __init__(self, config: HSKMConfig, layer_idx: int):
-        super().__init__()
-        self.ln1 = RMSNorm(config.d_model)
-        self.attn = MultiHeadKernelAttention(config)
-        
-        # Recurrent Medium Term (EMA) - optionally shared or separate
-        self.mtm  = MediumTermMemory(config)
-        self.ltm  = LongTermMemory(config)
-        self.gate = HierarchicalGating(config)
-        
-        self.ln2 = RMSNorm(config.d_model)
-        self.mlp = SwiGLU(config.d_model, 4 * config.d_model, config.dropout)
-        
-        # Scaling factor for deep residuals
-        self.layer_idx = layer_idx
-
-    def forward(self, x: Tensor) -> Tensor:
-        h = self.ln1(x)
-        h_s = self.attn(h)
-        h_m = self.mtm(h_s)
-        h_l = self.ltm(h)
-        
-        x = x + self.gate(h_s, h_m, h_l, h)
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-
-# Supporting classes (MediumTermMemory, LongTermMemory) remain similar but use RMSNorm
 class MediumTermMemory(nn.Module):
     def __init__(self, config: HSKMConfig):
         super().__init__()
@@ -216,26 +204,73 @@ class MediumTermMemory(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
         c = self.compress(x)
-        outputs = []
-        state = torch.zeros(B, c.size(-1), device=x.device, dtype=x.dtype)
-        for t in range(T):
-            state = self.decay * state + (1.0 - self.decay) * c[:, t, :]
-            outputs.append(state)
-        return self.decompress(torch.stack(outputs, dim=1))
+        alpha = 1.0 - self.decay
+        powers = self.decay ** torch.arange(T, device=x.device, dtype=x.dtype)
+        c_scaled = c * alpha
+        inv_powers = (1.0 / (powers + 1e-12)).unsqueeze(0).unsqueeze(-1)
+        c_undecayed = c_scaled * inv_powers
+        c_cumsum = torch.cumsum(c_undecayed, dim=1)
+        ema_out = c_cumsum * powers.unsqueeze(0).unsqueeze(-1)
+        return self.decompress(ema_out)
 
 
 class LongTermMemory(nn.Module):
     def __init__(self, config: HSKMConfig):
         super().__init__()
+        self.n_patterns = config.n_patterns
+        self.d_model = config.d_model
         self.patterns = nn.Parameter(torch.randn(config.n_patterns, config.d_model) * 0.02)
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.scale = config.d_model ** -0.5
+        self.write_key = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.write_val = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.write_gate = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.Sigmoid())
 
     def forward(self, x: Tensor) -> Tensor:
+        B, T, D = x.shape
+        context = x.mean(dim=1)
+        write_key = self.write_key(context)
+        write_value = self.write_val(context)
+        gate = self.write_gate(context)
+        write_attn = F.softmax(torch.matmul(write_key, self.patterns.t()) * self.scale, dim=-1)
+        pattern_delta = write_attn.unsqueeze(-1) * (gate * write_value).unsqueeze(1)
+        adapted = self.patterns.unsqueeze(0) + pattern_delta
         q = self.q_proj(x)
-        s = torch.matmul(q, self.patterns.t()) * self.scale
-        a = F.softmax(s, dim=-1)
-        return torch.matmul(a, self.patterns)
+        scores = torch.matmul(q, adapted.transpose(-2, -1)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        return torch.matmul(attn, adapted)
+
+
+# ─────────────────────────────────────────────
+#  5. HSKM Block & Model
+# ─────────────────────────────────────────────
+
+class HSKMBlock(nn.Module):
+    def __init__(self, config: HSKMConfig, layer_idx: int):
+        super().__init__()
+        self.ln1 = RMSNorm(config.d_model)
+        self.attn = MultiHeadKernelAttention(config)
+        self.mtm = MediumTermMemory(config)
+        self.ltm = LongTermMemory(config)
+        self.gate = HierarchicalGating(config)
+        self.ln2 = RMSNorm(config.d_model)
+        self.mlp = SwiGLU(config.d_model, 4 * config.d_model, config.dropout)
+        self.residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)
+        self.use_checkpoint = config.use_gradient_checkpointing
+
+    def _forward_body(self, x: Tensor) -> Tensor:
+        h = self.ln1(x)
+        h_s = self.attn(h)
+        h_m = self.mtm(h_s)
+        h_l = self.ltm(h)
+        x = x + self.residual_scale * self.gate(h_s, h_m, h_l, h)
+        x = x + self.residual_scale * self.mlp(self.ln2(x))
+        return x
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.use_checkpoint and self.training:
+            return grad_checkpoint(self._forward_body, x, use_reentrant=False)
+        return self._forward_body(x)
 
 
 class HSKM(nn.Module):
@@ -248,17 +283,12 @@ class HSKM(nn.Module):
         self.ln_f = RMSNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.head.weight = self.embedding.weight
-
         self.apply(self._init_weights)
-        print(f"[HSKM-V2] {self.num_params():,.0f} params")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # Scale initialization for deep models
-            std = 0.02
-            if hasattr(m, 'weight') and m.weight is not None:
-                torch.nn.init.normal_(m.weight, mean=0.0, std=std)
-            if hasattr(m, 'bias') and m.bias is not None:
+            torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -269,17 +299,13 @@ class HSKM(nn.Module):
     def forward(self, input_ids: Tensor, labels: Optional[Tensor] = None) -> Tuple[Optional[Tensor], Tensor]:
         x = self.embedding(input_ids)
         x = self.dropout(x)
-        
         for block in self.blocks:
             x = block(x)
-            
         x = self.ln_f(x)
         logits = self.head(x)
-        
         loss = None
         if labels is not None:
-            # Shift happens outside usually, but cross_entropy handles it if we pass targets
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-1)
         return loss, logits
 
     @torch.inference_mode()
@@ -288,17 +314,13 @@ class HSKM(nn.Module):
             ctx = input_ids[:, -self.config.max_seq_len:]
             _, logits = self.forward(ctx)
             next_logits = logits[:, -1, :] / (temperature + 1e-8)
-            
-            # Simple nucleus sampling
             sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
             cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_indices_to_remove = cum_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
-            
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
             next_logits[0, indices_to_remove] = -float('Inf')
-            
             probs = F.softmax(next_logits, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
