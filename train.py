@@ -1,7 +1,7 @@
 """
-HSKM Training Script (Streaming Edition)
+HSKM Training Script (Streaming Edition) - V3.1
 - Uses Infinite Streaming: Model sees new stories every step
-- Fixed steps per epoch for consistent checkpointing/graphing
+- Enhanced Metrics: Dual-axis plotting for Loss, Perplexity, and Token Usage
 """
 
 import os
@@ -32,19 +32,49 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, base_lr):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-def save_loss_plot(losses, tokens, epoch, path):
-    plt.figure(figsize=(10, 5))
-    plt.plot(tokens, losses, label='Training Loss')
-    plt.title(f'Training Loss (Tokens Seen: {tokens[-1]/1e6:.2f}M)')
-    plt.xlabel('Tokens Seen')
-    plt.ylabel('Loss')
-    plt.grid(True, alpha=0.3)
-    def format_func(value, tick_number):
+def save_metrics_plot(losses, tokens, path):
+    import math
+    ppls = [math.exp(min(l, 20)) for l in losses]
+    
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Axis 1: Loss
+    color1 = 'tab:blue'
+    ax1.set_xlabel('Steps')
+    ax1.set_ylabel('Cross Entropy Loss', color=color1)
+    ax1.plot(losses, color=color1, label='Loss', alpha=0.8)
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True, alpha=0.3)
+
+    # Axis 2: Perplexity
+    ax2 = ax1.twinx()
+    color2 = 'tab:red'
+    ax2.set_ylabel('Perplexity', color=color2)
+    ax2.plot(ppls, color=color2, label='Perplexity', alpha=0.6, linestyle='--')
+    ax2.tick_params(axis='y', labelcolor=color2)
+
+    # Axis 3: Token Usage (Cumulative)
+    ax3 = ax1.twinx()
+    ax3.spines['right'].set_position(('outward', 60))
+    color3 = 'tab:green'
+    ax3.set_ylabel('Total Tokens Seen', color=color3)
+    ax3.plot(tokens, color=color3, label='Tokens', alpha=0.4, linestyle=':')
+    ax3.tick_params(axis='y', labelcolor=color3)
+    
+    def format_tokens(value, tick_number):
         if value >= 1e6: return f'{value/1e6:.1f}M'
         if value >= 1e3: return f'{value/1e3:.0f}K'
         return f'{value:.0f}'
-    plt.gca().xaxis.set_major_formatter(plt.FuncFormatter(format_func))
-    plt.legend()
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(format_tokens))
+
+    fig.tight_layout()
+    plt.title(f'HSKM Training Metrics (Final PPL: {ppls[-1]:.2f})')
+    
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc='upper right')
+
     plt.savefig(path)
     plt.close()
 
@@ -98,7 +128,7 @@ def train(args):
             tokens_str = f"{total_tokens_seen/1e6:.2f}M" if total_tokens_seen >= 1e6 else f"{total_tokens_seen/1e3:.1f}K"
             pbar.set_postfix(loss=f"{l_val:.4f}", tokens=tokens_str, lr=f"{scheduler.get_last_lr()[0]:.2e}")
         with open(f"artifacts/epoch_{epoch+1}_steps.json", "w") as f: json.dump(epoch_step_logs, f, indent=2)
-        save_loss_plot(global_losses, global_tokens, epoch + 1, f"artifacts/loss_curve.png")
+        save_metrics_plot(global_losses, global_tokens, f"artifacts/loss_curve.png")
         model.eval()
         val_loss = 0
         val_iter = iter(val_loader)
