@@ -1,12 +1,15 @@
-# Hierarchical Sparse Kernel Memory (HSKM) - TinyStories Edition
+# Hierarchical Sparse Kernel Memory (HSKM) V3.1
 
-A hybrid language model combining **learned sparse kernel attention** with **hierarchical memory banks**, now optimized for the **TinyStories** dataset.
+A production-ready language model combining **learned sparse kernel attention** with **hierarchical memory banks**.
 
-## Features
-- **Infinite Streaming**: Model sees fresh data from the 2.1M TinyStories corpus in every batch.
-- **BPE Tokenization**: GPT-2 compatible byte-pair encoding.
-- **Advanced Architecture**: RMSNorm, SwiGLU, and Multi-Head Kernel Attention.
-- **Visual Analytics**: Step-wise JSON logging and real-time loss plots in `artifacts/`.
+## V3.1 Fixes
+- RoPE applied to queries (kernels stay position-invariant)
+- Vectorized EMA (no Python for-loop)
+- Truly sparse top-k before softmax
+- LTM with gated read/write operations
+- Gradient checkpointing support
+- Residual scaling by layer depth
+- Causal kernel gating (optional, off by default)
 
 ## Setup
 ```bash
@@ -19,12 +22,11 @@ python train.py --epochs 10 --batch_size 12 --seq_len 256
 ```
 
 ## Benchmarking
-To measure performance (throughput, latency, and VRAM):
 ```bash
 python benchmark.py
 ```
 
 ## Generation
 ```bash
-python generate.py --prompt "Once upon a time, there was a girl named Lily" --tokens 100
+python generate.py --prompt "Once upon a time" --tokens 100
 ```
