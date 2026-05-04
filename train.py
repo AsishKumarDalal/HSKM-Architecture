@@ -1,9 +1,7 @@
 """
-HSKM Training Script (Improved Stability & Step-wise Logging)
-- Adds LR warmup
-- Gradient clipping
-- Weight decay tuning
-- Step-wise loss logging to artifacts folder
+HSKM Training Script (Improved Stability, Logging & Plotting)
+- Adds LR warmup, Gradient clipping, Weight decay
+- Step-wise loss logging & visualization
 """
 
 import os
@@ -16,6 +14,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 import math
 import json
+import matplotlib.pyplot as plt
 
 from model import HSKM, HSKMConfig
 from dataset import build_dataloaders
@@ -25,17 +24,25 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, base_lr):
     def lr_lambda(current_step):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
-        # Cosine decay
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
-    
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+def save_loss_plot(losses, epoch, path):
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses, label='Training Loss')
+    plt.title(f'Training Loss (Up to Epoch {epoch})')
+    plt.xlabel('Global Step')
+    plt.ylabel('Loss')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.savefig(path)
+    plt.close()
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
     
-    # Configuration
     config = HSKMConfig(
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -47,7 +54,6 @@ def train(args):
     
     model = HSKM(config).to(device)
     
-    # Optimizer groups
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
@@ -64,10 +70,10 @@ def train(args):
     scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps, args.lr)
 
     os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("artifacts", exist_ok=True) # Create artifacts folder
+    os.makedirs("artifacts", exist_ok=True)
     
     best_val = float('inf')
-    all_step_losses = []
+    global_losses = []
 
     print(f"Starting training on {device}...")
     
@@ -78,7 +84,6 @@ def train(args):
         
         for step, (x, y) in enumerate(pbar):
             x, y = x.to(device), y.to(device)
-            
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp):
                 loss, _ = model(x, labels=y)
@@ -90,23 +95,19 @@ def train(args):
             scaler.update()
             scheduler.step()
             
-            # Log step loss
             l_val = loss.item()
-            epoch_step_losses.append({
-                "step": step,
-                "global_step": epoch * len(train_loader) + step,
-                "loss": round(l_val, 4)
-            })
-            
+            global_losses.append(l_val)
+            epoch_step_losses.append({"step": step, "loss": round(l_val, 4)})
             pbar.set_postfix(loss=f"{l_val:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
         
-        # Save epoch step-wise losses to artifacts
+        # Update logs & graphs
         epoch_log_path = f"artifacts/epoch_{epoch+1}_steps.json"
         with open(epoch_log_path, "w") as f:
             json.dump(epoch_step_losses, f, indent=2)
-        print(f"Step-wise losses for epoch {epoch+1} saved to {epoch_log_path}")
-        
-        all_step_losses.extend(epoch_step_losses)
+            
+        plot_path = f"artifacts/loss_curve.png"
+        save_loss_plot(global_losses, epoch + 1, plot_path)
+        print(f"Graph updated at {plot_path}")
 
         # Validation
         model.eval()
@@ -118,18 +119,11 @@ def train(args):
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         
-        # Save global history
-        with open("artifacts/history.json", "w") as f:
-            json.dump(all_step_losses, f, indent=2)
-            
         print(f"Val Loss: {val_loss:.4f} | PPL: {math.exp(min(val_loss, 20)):.2f}")
         
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({
-                'model': model.state_dict(),
-                'config': config.__dict__,
-            }, "checkpoints/best.pt")
+            torch.save({'model': model.state_dict(), 'config': config.__dict__}, "checkpoints/best.pt")
             print("★ New best model saved!")
 
 if __name__ == "__main__":
