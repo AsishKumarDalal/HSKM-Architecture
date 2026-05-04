@@ -1,7 +1,7 @@
 """
-HSKM Training Script (Improved Stability, Logging & Plotting)
-- Adds LR warmup, Gradient clipping, Weight decay
-- Step-wise loss logging & visualization
+HSKM Training Script (Stability, Step-wise Logging & Token Tracking)
+- Tracks tokens seen during training
+- Real-time plotting by token count
 """
 
 import os
@@ -28,13 +28,19 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, base_lr):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-def save_loss_plot(losses, epoch, path):
+def save_loss_plot(losses, tokens, epoch, path):
     plt.figure(figsize=(10, 5))
-    plt.plot(losses, label='Training Loss')
-    plt.title(f'Training Loss (Up to Epoch {epoch})')
-    plt.xlabel('Global Step')
+    plt.plot(tokens, losses, label='Training Loss')
+    plt.title(f'Training Loss vs Tokens Seen (Epoch {epoch})')
+    plt.xlabel('Tokens Seen')
     plt.ylabel('Loss')
     plt.grid(True, alpha=0.3)
+    # Format x-axis for readability (e.g., 1M, 2M)
+    def format_func(value, tick_number):
+        if value >= 1e6: return f'{value/1e6:.1f}M'
+        if value >= 1e3: return f'{value/1e3:.0f}K'
+        return f'{value:.0f}'
+    plt.gca().xaxis.set_major_formatter(plt.FuncFormatter(format_func))
     plt.legend()
     plt.savefig(path)
     plt.close()
@@ -74,16 +80,23 @@ def train(args):
     
     best_val = float('inf')
     global_losses = []
+    global_tokens = []
+    total_tokens_seen = 0
 
     print(f"Starting training on {device}...")
     
     for epoch in range(args.epochs):
         model.train()
-        epoch_step_losses = []
+        epoch_step_logs = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         
         for step, (x, y) in enumerate(pbar):
             x, y = x.to(device), y.to(device)
+            
+            # Count tokens in this batch
+            batch_tokens = x.numel()
+            total_tokens_seen += batch_tokens
+            
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp):
                 loss, _ = model(x, labels=y)
@@ -97,17 +110,26 @@ def train(args):
             
             l_val = loss.item()
             global_losses.append(l_val)
-            epoch_step_losses.append({"step": step, "loss": round(l_val, 4)})
-            pbar.set_postfix(loss=f"{l_val:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+            global_tokens.append(total_tokens_seen)
+            
+            epoch_step_logs.append({
+                "step": step,
+                "tokens_seen": total_tokens_seen,
+                "loss": round(l_val, 4)
+            })
+            
+            # Show tokens seen in tqdm (K/M format)
+            tokens_str = f"{total_tokens_seen/1e6:.2f}M" if total_tokens_seen >= 1e6 else f"{total_tokens_seen/1e3:.1f}K"
+            pbar.set_postfix(loss=f"{l_val:.4f}", tokens=tokens_str, lr=f"{scheduler.get_last_lr()[0]:.2e}")
         
         # Update logs & graphs
         epoch_log_path = f"artifacts/epoch_{epoch+1}_steps.json"
         with open(epoch_log_path, "w") as f:
-            json.dump(epoch_step_losses, f, indent=2)
+            json.dump(epoch_step_logs, f, indent=2)
             
         plot_path = f"artifacts/loss_curve.png"
-        save_loss_plot(global_losses, epoch + 1, plot_path)
-        print(f"Graph updated at {plot_path}")
+        save_loss_plot(global_losses, global_tokens, epoch + 1, plot_path)
+        print(f"Graph updated (Tokens: {tokens_str}) at {plot_path}")
 
         # Validation
         model.eval()
