@@ -10,21 +10,14 @@ from tokenizer import BPETokenizer
 
 
 def get_streaming_dataset():
-    """Returns a streaming HuggingFace dataset for TinyStories."""
     from datasets import load_dataset
     print("[Dataset] Initializing TinyStories Stream …")
-    # Stream both train and validation
     ds_train = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
     ds_val   = load_dataset("roneneldan/TinyStories", split="validation", streaming=True)
     return ds_train, ds_val
 
 
 class StreamingTokenDataset(IterableDataset):
-    """
-    Infinite iterable dataset that streams stories, tokenizes them,
-    and yields fixed-length chunks.
-    """
-
     def __init__(self, hf_stream, tokenizer: BPETokenizer, seq_len: int):
         self.hf_stream = hf_stream
         self.tokenizer = tokenizer
@@ -34,32 +27,20 @@ class StreamingTokenDataset(IterableDataset):
         buffer = []
         for example in self.hf_stream:
             text = example["text"].strip()
-            # Tokenize and add to buffer
             tokens = self.tokenizer.encode(text, add_bos=True, add_eos=True)
             buffer.extend(tokens)
-            
-            # Yield chunks as they become available
             while len(buffer) >= self.seq_len + 1:
                 chunk = buffer[:self.seq_len + 1]
                 buffer = buffer[self.seq_len + 1:]
-                
-                x = torch.tensor(chunk[:-1], dtype=torch.long)
-                y = torch.tensor(chunk[1:], dtype=torch.long)
-                yield x, y
+                yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long)
 
 
 def build_dataloaders(seq_len: int = 512, batch_size: int = 8):
     tokenizer = BPETokenizer()
     ds_train, ds_val = get_streaming_dataset()
-    
-    # Shuffle the stream using a buffer
     ds_train = ds_train.shuffle(buffer_size=10000, seed=42)
-    
     train_ds = StreamingTokenDataset(ds_train, tokenizer, seq_len)
     val_ds   = StreamingTokenDataset(ds_val, tokenizer, seq_len)
-    
-    # For streaming, we don't shuffle in DataLoader, we shuffle the HF stream
     train_loader = DataLoader(train_ds, batch_size=batch_size, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=batch_size, pin_memory=True)
-    
     return train_loader, val_loader, tokenizer

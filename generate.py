@@ -15,8 +15,6 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load model
     checkpoint = torch.load(args.ckpt, map_location=device)
     config = HSKMConfig(**checkpoint['config'])
     model = HSKM(config).to(device)
