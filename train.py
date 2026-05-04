@@ -108,7 +108,6 @@ def train(args):
         for step in pbar:
             try: x, y = next(train_iter)
             except StopIteration:
-                print("\n[Dataset] Stream exhausted, restarting with new shuffle...")
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
             x, y = x.to(device), y.to(device)

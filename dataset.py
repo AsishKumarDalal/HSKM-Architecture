@@ -35,14 +35,10 @@ class StreamingTokenDataset(IterableDataset):
                 yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long)
 
 
-def build_dataloaders(seq_len: int = 512, batch_size: int = 8, seed: int = None):
+def build_dataloaders(seq_len: int = 512, batch_size: int = 8):
     tokenizer = BPETokenizer()
     ds_train, ds_val = get_streaming_dataset()
-    
-    # Use a random seed if none provided to ensure different data on restart
-    actual_seed = seed if seed is not None else torch.randint(0, 1000000, (1,)).item()
-    ds_train = ds_train.shuffle(buffer_size=10000, seed=actual_seed)
-    
+    ds_train = ds_train.shuffle(buffer_size=10000, seed=42)
     train_ds = StreamingTokenDataset(ds_train, tokenizer, seq_len)
     val_ds   = StreamingTokenDataset(ds_val, tokenizer, seq_len)
     train_loader = DataLoader(train_ds, batch_size=batch_size, pin_memory=True)
